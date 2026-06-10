@@ -113,6 +113,15 @@ methods you don't have turned on, so you can see what they would add.
 Nothing gets deleted or punished in the test channel, since it is only meant for tuning. It
 also works while detection is off, which means you can try things out before going live.
 
+### Analyze a message
+
+`/analyze` runs that same breakdown on a message that has already been posted, without a test
+channel and without reposting it. Pass a message ID or a message link (right-click a message,
+then Copy Message ID or Copy Message Link) and Exorcist replies with the score and the
+per-method breakdown, visible only to you. If the message is in a different channel from where
+you run the command, add the `channel` option or just paste the link. Like the test channel it
+only reads, it never deletes or punishes.
+
 ## Who can use it
 
 Server admins can always run the commands, so you can set the bot up out of the box. To let

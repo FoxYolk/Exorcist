@@ -3,6 +3,11 @@ import logging
 
 log = logging.getLogger("exorcist.ocr")
 
+# tesseract crawls on huge bitmaps, so bound the work two ways: never feed it more than this
+# many pixels, and kill any single read that still runs past this many seconds.
+MAX_PIXELS = 5_000_000
+READ_TIMEOUT = 20
+
 
 class TesseractOCR:
     def __init__(self, cmd=None):
@@ -19,22 +24,31 @@ class TesseractOCR:
         img = self._prep(self._Image.open(io.BytesIO(data)))
         # psm 6 reads the image as blocks of lines, which keeps phrases like
         # "your withdrawal of $2700" together instead of scattering the words
-        return self._pt.image_to_string(img, config="--psm 6")
+        return self._pt.image_to_string(img, config="--psm 6", timeout=READ_TIMEOUT)
 
     def _prep(self, img):
         # clean the image up before tesseract sees it: grayscale, flip dark mode
-        # screenshots so the text is dark on light, scale small images up, stretch contrast
+        # screenshots so the text is dark on light, scale to a readable size, stretch contrast
         ops = self._ImageOps
         img = img.convert("L")
         if self._mean(img) < 110:
             # most of these scams are dark mode posts, light text on black, which tesseract
             # reads terribly. inverting turns it into dark text on light, which it reads well
             img = ops.invert(img)
+        img = self._fit(img)
+        return ops.autocontrast(img, cutoff=2)
+
+    def _fit(self, img):
+        # scale small images up so tesseract has pixels to work with, but cap the total so a
+        # tall screenshot doesn't balloon into a giant bitmap that takes minutes to read
         w, h = img.size
         if w < 1600:
-            factor = 1600 / w
-            img = img.resize((int(w * factor), int(h * factor)))
-        return ops.autocontrast(img, cutoff=2)
+            f = 1600 / w
+            w, h = round(w * f), round(h * f)
+        if w * h > MAX_PIXELS:
+            f = (MAX_PIXELS / (w * h)) ** 0.5
+            w, h = round(w * f), round(h * f)
+        return img.resize((w, h)) if (w, h) != img.size else img
 
     @staticmethod
     def _mean(img):

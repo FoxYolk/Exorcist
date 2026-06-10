@@ -1,9 +1,15 @@
+import asyncio
 import logging
 from datetime import timedelta
 
 import discord
 
 log = logging.getLogger("exorcist.actions")
+
+# a member with DMs closed fails fast, but opening a DM channel is heavily rate limited, so a
+# burst of catches can make a send hang for a while. cap it so removal and logging never wait
+# on the DM.
+DM_TIMEOUT = 10
 
 RESECURE_DM = (
     "Hey, your account just posted a scam in **{guild}**, which almost always means it got "
@@ -37,11 +43,11 @@ async def punish(message, guild_conf, reason):
             body += "\n\nOnce it's actually secured, hit the button below to lift your own timeout."
             view = unmute_view(message.guild.id)
         try:
-            await member.send(body, view=view)
+            await asyncio.wait_for(member.send(body, view=view), timeout=DM_TIMEOUT)
             done.append("DM sent")
         except discord.Forbidden:
             done.append("DM closed")
-        except discord.HTTPException:
+        except (discord.HTTPException, asyncio.TimeoutError):
             done.append("DM failed")
 
     # only one removal makes sense, strongest wins

@@ -1,4 +1,5 @@
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -10,6 +11,10 @@ from ..detection import Verdict, first_image
 from ..theme import SPARK
 
 log = logging.getLogger("exorcist.watch")
+
+# matches the channel and message ids out of a link like
+# https://discord.com/channels/<guild>/<channel>/<message>
+MSG_LINK_RE = re.compile(r"/channels/\d+/(\d+)/(\d+)")
 
 
 class Watch(commands.Cog):
@@ -148,6 +153,51 @@ class Watch(commands.Cog):
             pass
         await interaction.response.send_message(f"Added that image to the scam list, it'll get caught next time. {SPARK}", ephemeral=True)
 
+    @app_commands.command(description="Analyze a posted message and its media against the detector")
+    @app_commands.guild_only()
+    @app_commands.describe(
+        message="Message ID, or a message link (right-click a message > Copy Message Link)",
+        channel="Channel the message is in, if you passed an ID and it isn't in this channel",
+    )
+    async def analyze(self, interaction, message: str, channel: discord.TextChannel = None):
+        if not is_manager(interaction.user, self.config.guild(interaction.guild_id)):
+            return await interaction.response.send_message(DENIED, ephemeral=True)
+
+        chan_id, msg_id = parse_message_ref(message)
+        if msg_id is None:
+            return await interaction.response.send_message(
+                "That isn't a message ID or link. Right-click a message and use Copy Message ID "
+                "or Copy Message Link.",
+                ephemeral=True,
+            )
+
+        # a link carries its own channel, otherwise fall back to the one passed or the current one
+        target = channel or interaction.channel
+        if chan_id is not None:
+            target = interaction.guild.get_channel_or_thread(chan_id) or target
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            msg = await target.fetch_message(msg_id)
+        except discord.NotFound:
+            return await interaction.followup.send(
+                f"Couldn't find that message in {target.mention}. If it's in another channel, "
+                "pass the channel option or paste the message link.",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                f"I can't read messages in {target.mention}, check my permissions there.",
+                ephemeral=True,
+            )
+
+        conf = self.config.guild(interaction.guild_id)
+        result = await self.detector.analyze(msg, conf)
+        await interaction.followup.send(
+            embed=logs.analysis_embed(msg, result, footer="Analysis only, nothing gets actioned"),
+            ephemeral=True,
+        )
+
 
 class ReviewView(discord.ui.View):
     def __init__(self, cog, message, verdict, conf):
@@ -221,6 +271,18 @@ class UndoView(discord.ui.View):
         set_status(e, f"False alarm by {interaction.user.mention}, {note}")
         await interaction.response.edit_message(embed=e, view=self)
         self.stop()
+
+
+def parse_message_ref(raw):
+    """Pull (channel_id, message_id) out of a message link, or (None, message_id) from a bare
+    id. Returns (None, None) if it's neither."""
+    raw = raw.strip()
+    m = MSG_LINK_RE.search(raw)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    if raw.isdigit():
+        return None, int(raw)
+    return None, None
 
 
 def is_trap(message, conf):

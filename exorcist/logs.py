@@ -34,7 +34,7 @@ def scam_embed(message, verdict, status):
     return e
 
 
-def analysis_embed(message, result):
+def analysis_embed(message, result, footer="Test channel, nothing gets actioned here"):
     flagged = result["is_scam"]
     mark, color = (FLAGGED, CATCH) if flagged else (CLEAN, PASS)
     head = "would be flagged" if flagged else "would pass"
@@ -49,7 +49,7 @@ def analysis_embed(message, result):
             dot, body = NONE, "Nothing"
         e.add_field(name=f"{dot}  {layer['name']}  +{layer['score']:.2f}", value=body, inline=False)
 
-    e.set_footer(text="Test channel, nothing gets actioned here")
+    e.set_footer(text=footer)
     return e
 
 
