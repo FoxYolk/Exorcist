@@ -1,0 +1,4 @@
+# dev/test only, not needed to run the bot
+-r requirements.txt
+pytest==8.3.4
+ruff==0.6.9

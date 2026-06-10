@@ -2,7 +2,7 @@ import discord
 
 from . import logs
 from .actions import pretty_minutes
-from .theme import PASS, SPARK, VIOLET, card, progress
+from .theme import BULLET, PASS, SPARK, VIOLET, WARN, card, progress
 
 METHOD_LABELS = {
     "behavior": "Behavior",
@@ -38,6 +38,11 @@ DISTANCES = [
     ("Loose", 14, "Catches lookalikes and variants"),
     ("Very loose", 18, "Catches a lot, expect some false hits"),
 ]
+THRESHOLDS = [
+    ("Lenient", 1.0, "Needs a strong signal, fewest false hits"),
+    ("Balanced", 0.8, "The default"),
+    ("Strict", 0.6, "Acts on weaker, stacked signals"),
+]
 
 # wizard step number -> the setting that step edits
 STEP_FIELD = {
@@ -53,18 +58,31 @@ class SetupWizard(discord.ui.View):
     """First run walkthrough. Nothing is written until the last step saves."""
 
     def __init__(self, config, guild_id, draft):
-        super().__init__(timeout=300)
+        super().__init__(timeout=840)  # under the 15 min interaction token; it asks you to go make channels
         self.config = config
         self.guild_id = guild_id
         self.draft = draft
         self.step = 0
+        self._origin = None
         self.pages = [self._welcome, self._channels, self._methods, self._log, self._mode,
                       self._punish, self._timeout, self._self_unmute, self._trap, self._learn,
                       self._summary]
 
     async def start(self, interaction):
+        self._origin = interaction
         self._render()
         await interaction.response.send_message(embed=self.pages[self.step](), view=self, ephemeral=True)
+
+    async def on_timeout(self):
+        if self._origin is None:
+            return
+        try:
+            await self._origin.edit_original_response(
+                embed=card("Setup timed out", "Nothing was saved. Run `/setup` to start again.", kind="Setup"),
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
 
     async def refresh(self, interaction):
         self._render()
@@ -104,6 +122,16 @@ class SetupWizard(discord.ui.View):
         self.stop()
 
     async def _save(self, interaction):
+        # don't let setup finish in a state that silently does nothing (no log channel, no
+        # channels picked, honeypot method with no trap channel) and then claim it's watching
+        problems = validate_setup(self.draft)
+        if problems:
+            e = self._summary()
+            e.color = WARN
+            e.add_field(name="Fix these before saving",
+                        value="\n".join(f"{BULLET} {p}" for p in problems), inline=False)
+            await interaction.response.edit_message(embed=e, view=self)
+            return
         # re-read so anything changed while the wizard was open (an /access add, say) survives
         saved = self.config.guild(self.guild_id)
         old_trap = saved.get("trap_channel")
@@ -204,8 +232,10 @@ class SettingsPanel(discord.ui.View):
         ("channels", "Channels to watch"),
         ("methods", "Detection methods"),
         ("hash_distance", "Image match strictness"),
+        ("threshold", "Detection threshold"),
         ("log_channel", "Log channel"),
         ("action_mode", "Action mode"),
+        ("exempt_mods", "Exempt mods"),
         ("punishments", "Punishments"),
         ("timeout_minutes", "Timeout length"),
         ("self_unmute", "Self unmute"),
@@ -215,22 +245,41 @@ class SettingsPanel(discord.ui.View):
     ]
 
     def __init__(self, config, guild_id):
-        super().__init__(timeout=300)
+        super().__init__(timeout=840)
         self.config = config
         self.guild_id = guild_id
         self.draft = config.guild(guild_id)
         self.field = None
+        self._origin = None
 
     async def start(self, interaction):
+        self._origin = interaction
         self._render()
         await interaction.response.send_message(embed=self._embed(), view=self, ephemeral=True)
+
+    async def on_timeout(self):
+        if self._origin is None:
+            return
+        try:
+            await self._origin.edit_original_response(
+                embed=card("Settings timed out", "Run `/settings` again to make more changes.", kind="Settings"),
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
 
     async def _navigate(self, interaction):
         self._render()
         await interaction.response.edit_message(embed=self._embed(), view=self)
 
     async def refresh(self, interaction):
-        self.config.set_guild(self.guild_id, self.draft)
+        # re-read and write back only the field being edited, so a change another mod made
+        # (a different panel, /toggle, /access add) isn't reverted by this panel's stale snapshot
+        if self.field is not None:
+            saved = self.config.guild(self.guild_id)
+            saved[self.field] = self.draft[self.field]
+            self.config.set_guild(self.guild_id, saved)
+            self.draft = saved
         if self.field == "trap_channel":
             await post_trap_warning(interaction, self.draft, None)
         await self._navigate(interaction)
@@ -281,6 +330,11 @@ def build_editor(host, field):
     elif field == "hash_distance":
         opts = [discord.SelectOption(label=l, description=desc, value=str(n), default=n == d["hash_distance"]) for l, n, desc in DISTANCES]
         host.add_item(_IntPick(host, "hash_distance", "Image match strictness", opts))
+    elif field == "threshold":
+        opts = [discord.SelectOption(label=l, description=desc, value=str(v), default=v == d["threshold"]) for l, v, desc in THRESHOLDS]
+        host.add_item(_FloatPick(host, "threshold", "Detection threshold", opts))
+    elif field == "exempt_mods":
+        host.add_item(_TogglePick(host, "exempt_mods", "Skip messages from mods", d["exempt_mods"]))
     elif field == "self_unmute":
         host.add_item(_TogglePick(host, "self_unmute", "Let timed out users unmute themselves", d["self_unmute"]))
     elif field == "trap_channel":
@@ -311,6 +365,7 @@ def fill_summary(e, d):
     detection = (
         f"Methods  {methods}\n"
         f"Image match  {distance_label(d['hash_distance'])}\n"
+        f"Threshold  {threshold_label(d['threshold'])}\n"
         f"Mode  {d['action_mode'].capitalize()}"
     )
     e.add_field(name="Detection", value=detection, inline=False)
@@ -339,6 +394,26 @@ def distance_label(n):
         if val == n:
             return label
     return f"Custom ({n})"
+
+
+def threshold_label(n):
+    for label, val, _ in THRESHOLDS:
+        if val == n:
+            return label
+    return f"Custom ({n:.2f})"
+
+
+def validate_setup(d):
+    problems = []
+    if not d["methods"]:
+        problems.append("Pick at least one detection method.")
+    if d["log_channel"] is None:
+        problems.append("Pick a log channel — Exorcist won't act without one.")
+    if d["channels"] != "all" and not d["channels"]:
+        problems.append("Pick at least one channel to watch, or choose every channel.")
+    if "honeypot" in d["methods"] and not d["trap_channel"]:
+        problems.append("You turned on the honeypot method but didn't pick a trap channel.")
+    return problems
 
 
 def channels_text(d):
@@ -424,6 +499,17 @@ class _IntPick(discord.ui.Select):
 
     async def callback(self, interaction):
         self.host.draft[self.key] = int(self.values[0])
+        await self.host.refresh(interaction)
+
+
+class _FloatPick(discord.ui.Select):
+    def __init__(self, host, key, placeholder, options):
+        super().__init__(placeholder=placeholder, options=options, min_values=1, max_values=1, row=0)
+        self.host = host
+        self.key = key
+
+    async def callback(self, interaction):
+        self.host.draft[self.key] = float(self.values[0])
         await self.host.refresh(interaction)
 
 

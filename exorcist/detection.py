@@ -7,8 +7,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
+import imagehash
+from PIL import Image
 
 log = logging.getLogger("exorcist.detection")
 
@@ -20,6 +23,14 @@ MAX_FRAMES = 4                                 # frames sampled from an animated
 IMAGE_EMBED_TYPES = {"image", "gifv", "gif"}   # embed types we treat as a scam image source
 EMBED_FETCH_TIMEOUT = 10
 MAX_EMBED_BYTES = 8_000_000
+MAX_ATTACH_BYTES = 8_000_000                   # skip uploads bigger than this before reading them
+OCR_CONCURRENCY = 2                            # cap simultaneous tesseract reads so bursts queue
+# only fetch embed images from known image CDNs. blocks a posted link from pointing the bot's
+# host at an internal/attacker address (SSRF) and keeps the "stays local" promise mostly true.
+ALLOWED_EMBED_HOSTS = (
+    "discordapp.net", "discordapp.com", "discord.com",
+    "tenor.com", "giphy.com", "imgur.com",
+)
 
 
 @dataclass
@@ -59,6 +70,10 @@ class Detector:
         self.config = config
         self.ocr = ocr
         self.behavior = BehaviorTracker()
+        self._ocr_sem = asyncio.Semaphore(OCR_CONCURRENCY)
+        self._http = None            # one shared aiohttp session, opened lazily in the loop
+        self._known_cache = None     # parsed known hashes, rebuilt when the pool changes
+        self._known_version = None
 
         words = json.loads(Path(keywords_path).read_text(encoding="utf-8"))
         self.keywords = [k.lower() for k in words.get("keywords", [])]
@@ -67,8 +82,24 @@ class Detector:
         seed = Path(seed_hashes_path)
         self.seed_hashes = json.loads(seed.read_text(encoding="utf-8")) if seed.exists() else []
 
+    async def close(self):
+        if self._http and not self._http.closed:
+            await self._http.close()
+
+    async def _session(self):
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
+
+    async def first_image_blob(self, message):
+        """First usable image (attachment OR embed) as (name, bytes), or None. Shared by the
+        honeypot and Mark-as-scam so they see the same sources the scorer does, embeds included."""
+        blobs = await self._download_images(message)
+        return blobs[0] if blobs else None
+
     async def evaluate(self, message, guild_conf):
         methods = guild_conf["methods"]
+        threshold = guild_conf["threshold"]
         v = Verdict()
 
         blobs = await self._download_images(message) if ("imagehash" in methods or "keyword" in methods) else []
@@ -76,22 +107,29 @@ class Detector:
             v.image_name, v.image = blobs[0]
 
         if "imagehash" in methods and blobs:
-            score, reasons, h, img, name = await self._score_imagehash(blobs, guild_conf["hash_distance"])
+            score, reasons, h, img, name = await asyncio.to_thread(
+                self._imagehash_sync, blobs, guild_conf["hash_distance"]
+            )
             v.score += score
             v.reasons += reasons
             if h:
                 v.image_hash, v.image, v.image_name = h, img, name
-        if "keyword" in methods:
-            score, reasons, text = self._score_keywords(message, await self._read_images(blobs))
-            v.score += score
-            v.reasons += reasons
-            v.text = text
         if "behavior" in methods:
             score, reasons = self._score_behavior(message, record=True)
             v.score += score
             v.reasons += reasons
+        if "keyword" in methods:
+            # OCR is by far the most expensive step. Once the cheaper signals have already
+            # crossed the threshold (e.g. a known-image hit during a raid) the verdict is
+            # decided, so skip reading the image text and act faster.
+            need_ocr = bool(blobs) and self.ocr is not None and v.score < threshold
+            ocr_text = await self._read_images(blobs) if need_ocr else ""
+            score, reasons, text = self._score_keywords(message, ocr_text)
+            v.score += score
+            v.reasons += reasons
+            v.text = text
 
-        v.is_scam = v.score >= guild_conf["threshold"]
+        v.is_scam = v.score >= threshold
         return v
 
     async def analyze(self, message, guild_conf):
@@ -101,7 +139,7 @@ class Detector:
         blobs = await self._download_images(message)
         ocr_text = await self._read_images(blobs)
 
-        ih = await self._score_imagehash(blobs, guild_conf["hash_distance"]) if blobs else (0.0, [], None, None, None)
+        ih = await asyncio.to_thread(self._imagehash_sync, blobs, guild_conf["hash_distance"]) if blobs else (0.0, [], None, None, None)
         kw = self._score_keywords(message, ocr_text)
         bh = self._score_behavior(message, record=False)
 
@@ -120,6 +158,11 @@ class Detector:
     async def _download_images(self, message):
         blobs = []
         for a in image_attachments(message)[:MAX_IMAGES]:
+            # skip huge uploads before reading them into RAM — Attachment.size is free, and a
+            # handful of 25-500MB files across concurrent messages would otherwise OOM the host
+            if a.size and a.size > MAX_ATTACH_BYTES:
+                log.info("skipping oversized attachment %s (%d bytes)", a.filename, a.size)
+                continue
             try:
                 blobs.append((a.filename, await a.read()))
             except Exception as e:
@@ -132,21 +175,35 @@ class Detector:
         return blobs
 
     async def _fetch_embeds(self, urls):
-        out = []
-        async with aiohttp.ClientSession() as session:
-            for url in urls:
-                if not url.startswith(("http://", "https://")):
-                    continue
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=EMBED_FETCH_TIMEOUT)) as resp:
-                        if resp.status != 200 or not resp.content_type.startswith("image/"):
-                            continue
-                        if (resp.content_length or 0) > MAX_EMBED_BYTES:
-                            continue
-                        out.append((embed_name(url), await resp.read()))
-                except Exception as e:
-                    log.warning("couldn't fetch embed image: %s", e)
-        return out
+        session = await self._session()
+        results = await asyncio.gather(*(self._fetch_one(session, url) for url in urls))
+        return [r for r in results if r]
+
+    async def _fetch_one(self, session, url):
+        if not _allowed_embed_url(url):
+            return None
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=EMBED_FETCH_TIMEOUT),
+                allow_redirects=False,
+            ) as resp:
+                if resp.status != 200 or not resp.content_type.startswith("image/"):
+                    return None
+                if (resp.content_length or 0) > MAX_EMBED_BYTES:
+                    return None
+                # stream with a running cap so a chunked response with no Content-Length can't
+                # buffer an unbounded body into memory
+                data = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    data += chunk
+                    if len(data) > MAX_EMBED_BYTES:
+                        log.info("embed image over size cap, dropping: %s", url)
+                        return None
+                return (embed_name(url), bytes(data))
+        except Exception as e:
+            log.warning("couldn't fetch embed image: %s", e)
+            return None
 
     async def _read_images(self, blobs):
         if not blobs or not self.ocr:
@@ -154,34 +211,51 @@ class Detector:
         chunks = []
         for _, data in blobs:
             try:
-                chunks.append(await asyncio.to_thread(self.ocr.read, data))
+                async with self._ocr_sem:
+                    chunks.append(await asyncio.to_thread(self.ocr.read, data))
             except Exception as e:
                 log.warning("ocr read failed: %s", e)
         return "\n".join(chunks)
 
-    async def _score_imagehash(self, blobs, max_distance):
-        try:
-            import imagehash
-        except ImportError:
-            return 0.0, [], None, None, None
-
-        known = list(self.config.learned_hashes) + self.seed_hashes
+    def _imagehash_sync(self, blobs, max_distance):
+        # runs in a worker thread (called via to_thread): hashing AND comparison are CPU work
+        # and must stay off the event loop. returns (score, reasons, hex_hash, img, name).
+        known = self._known_hashes()
         best_hash = best_img = best_name = None
         for name, data in blobs:
-            frame_hashes = await asyncio.to_thread(phashes, data)
+            frame_hashes = phashes(data)
             if not frame_hashes:
                 continue
             if best_hash is None:
-                best_hash, best_img, best_name = frame_hashes[0], data, name
-            if any(self._matches(imagehash, h, known, max_distance) for h in frame_hashes):
-                return 1.0, ["Matches a known scam image"], frame_hashes[0], data, name
-        return 0.0, [], best_hash, best_img, best_name
+                # for a learn-on keyword/behavior catch we store this image's hash; prefer a
+                # non-flat frame so we don't teach a degenerate hash that collides with the
+                # blank opening frame of unrelated gifs across every server reading the pool
+                best_hash, best_img, best_name = _representative(frame_hashes), data, name
+            for h in frame_hashes:
+                if self._matches(h, known, max_distance):
+                    # learn the frame that actually matched, not frame 0
+                    return 1.0, ["Matches a known scam image"], str(h), data, name
+        return 0.0, [], (str(best_hash) if best_hash is not None else None), best_img, best_name
 
-    def _matches(self, imagehash, h, known, max_distance):
-        target = imagehash.hex_to_hash(h)
+    def _known_hashes(self):
+        # parse the hex pool into ImageHash objects once and reuse until the pool changes,
+        # instead of re-parsing every known hash on every comparison
+        version = self.config.hash_version
+        if self._known_cache is None or self._known_version != version:
+            parsed = []
+            for hx in list(self.config.learned_hashes) + self.seed_hashes:
+                try:
+                    parsed.append(imagehash.hex_to_hash(hx))
+                except (ValueError, TypeError):
+                    log.warning("skipping unparseable known hash: %r", hx)
+            self._known_cache = parsed
+            self._known_version = version
+        return self._known_cache
+
+    def _matches(self, h, known, max_distance):
         for k in known:
             try:
-                if target - imagehash.hex_to_hash(k) <= max_distance:
+                if h - k <= max_distance:
                     return True
             except Exception:
                 continue
@@ -309,30 +383,45 @@ def worth_tracking(message):
 
 
 def phashes(data, max_frames=MAX_FRAMES):
-    """Perceptual hashes for an image. A still image gives one hash, computed exactly like
-    phash so the shipped seeds still match. An animated gif or webp gives a few, sampled
-    across its frames, so a scam shown only on a later frame is caught and not just frame 0."""
+    """Perceptual hashes for an image, as ImageHash objects. A still image gives one, computed
+    exactly like phash so the shipped seeds still match. An animated gif or webp gives a few,
+    sampled across its frames, so a scam shown only on a later frame is caught and not just
+    frame 0."""
     try:
-        import imagehash
-        from PIL import Image
-
         img = Image.open(io.BytesIO(data))
-    except Exception:
+    except Exception as e:
+        log.debug("couldn't open image for hashing: %s", e)
         return []
     total = getattr(img, "n_frames", 1)
     if total <= 1 or max_frames <= 1:
         try:
-            return [str(imagehash.phash(img))]
-        except Exception:
+            return [imagehash.phash(img)]
+        except Exception as e:
+            log.debug("phash failed: %s", e)
             return []
     out = []
     for i in frame_indexes(total, max_frames):
         try:
             img.seek(i)
-            out.append(str(imagehash.phash(img.convert("RGB"))))
-        except Exception:
+            out.append(imagehash.phash(img.convert("RGB")))
+        except Exception as e:
+            log.debug("frame phash failed: %s", e)
             continue
     return out
+
+
+def _representative(frame_hashes):
+    for h in frame_hashes:
+        if not _is_degenerate(h):
+            return h
+    return frame_hashes[0]
+
+
+def _is_degenerate(h):
+    # a near-uniform (blank/solid) frame hashes to almost-all-equal bits, which matches far too
+    # loosely. count the set bits of the 64-bit hash and treat the lopsided ends as degenerate.
+    ones = int(h.hash.sum())
+    return ones <= 6 or ones >= 58
 
 
 def frame_indexes(total, count):
@@ -344,9 +433,17 @@ def frame_indexes(total, count):
 
 def phash(data):
     try:
-        import imagehash
-        from PIL import Image
-
         return str(imagehash.phash(Image.open(io.BytesIO(data))))
-    except Exception:
+    except Exception as e:
+        log.debug("phash failed: %s", e)
         return None
+
+
+def _allowed_embed_url(url):
+    if not url.startswith("https://"):
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in ALLOWED_EMBED_HOSTS)

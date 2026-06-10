@@ -12,5 +12,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# pass DISCORD_TOKEN as an env var, and mount a volume at /app/config.json to keep settings
+# settings (and the learned hash pool) live in a mounted directory, not a single bind-mounted
+# file: os.replace can't atomically swap a bind-mounted file (EBUSY), and a host file that
+# doesn't exist yet would be created as a directory and crash startup
+ENV EXORCIST_CONFIG=/data/config.json
+RUN mkdir -p /data
+VOLUME /data
+
+# pass DISCORD_TOKEN as an env var; mount a volume at /data to keep settings across restarts
 CMD ["python", "main.py"]

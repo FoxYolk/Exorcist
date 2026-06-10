@@ -86,10 +86,13 @@ Or with Docker, which bundles Tesseract for you:
 
 ```
 docker build -t exorcist .
-docker run -e DISCORD_TOKEN=your-token -v $(pwd)/config.json:/app/config.json exorcist
+docker run -e DISCORD_TOKEN=your-token -v exorcist-data:/data exorcist
 ```
 
-The volume keeps your per-server settings between restarts.
+The `exorcist-data` volume keeps your per-server settings (and the learned hash pool) between
+restarts. Mount a host folder instead with `-v "$(pwd)/data:/data"` if you'd rather see the
+file directly. (Mounting a single `config.json` file doesn't work — the bot writes settings by
+swapping a temp file into place, which a bind-mounted file blocks.)
 
 ### 4. Configure
 

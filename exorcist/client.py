@@ -40,9 +40,17 @@ class Exorcist(commands.Bot):
             activity=discord.Activity(type=discord.ActivityType.watching, name="for scams")
         )
 
+    async def close(self):
+        # release the shared aiohttp session the detector opened for embed fetches
+        await self.detector.close()
+        await super().close()
+
     async def _on_command_error(self, interaction, error):
-        log.exception("command %s failed: %s", getattr(interaction.command, "name", "?"), error)
-        message = "Something broke running that. Give it another go in a sec."
+        # tag the console log and the user reply with the same short ref so a report can be
+        # matched to its traceback
+        ref = f"{id(error) & 0xffffff:06x}"
+        log.exception("command %s failed [ref %s]: %s", getattr(interaction.command, "name", "?"), ref, error)
+        message = f"Something broke running that (ref `{ref}`). Check the bot's console log if it keeps happening."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)

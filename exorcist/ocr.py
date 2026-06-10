@@ -21,6 +21,10 @@ class TesseractOCR:
         self._ImageOps = ImageOps
         if cmd:
             pytesseract.pytesseract.tesseract_cmd = cmd
+        # probe the binary up front so a missing or mis-pathed Tesseract surfaces at startup
+        # (load_ocr then returns None and /status can show OCR is off) instead of silently
+        # failing on every single image read forever
+        pytesseract.get_tesseract_version()
 
     def read(self, data):
         img = self._prep(self._Image.open(io.BytesIO(data)))

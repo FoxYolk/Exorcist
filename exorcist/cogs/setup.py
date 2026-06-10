@@ -2,11 +2,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import logs
+from .. import actions, logs
 from ..access import DENIED, is_manager
 from ..theme import HIT, NONE, PASS, SPARK, VIOLET, WARN, card
 from ..wizard import (PUNISH, SettingsPanel, SetupWizard, channel_mention, channels_text,
-                      distance_label, methods_text, pretty_minutes)
+                      distance_label, methods_text, pretty_minutes, threshold_label)
 
 
 class Setup(commands.Cog):
@@ -44,7 +44,9 @@ class Setup(commands.Cog):
                  color=PASS if c["enabled"] else VIOLET)
 
         e.add_field(name="Detection",
-                    value=f"Methods  {methods_text(c) or 'None'}\nImage match  {distance_label(c['hash_distance'])}",
+                    value=(f"Methods  {methods_text(c) or 'None'}\n"
+                           f"Image match  {distance_label(c['hash_distance'])}\n"
+                           f"Threshold  {threshold_label(c['threshold'])}"),
                     inline=False)
 
         where = f"Watching  {channels_text(c)}\nLog  {channel_mention(c['log_channel'])}"
@@ -62,6 +64,18 @@ class Setup(commands.Cog):
         learn = "training" if c["learn"] else "using existing"
         e.add_field(name="Scam data",
                     value=f"Seed {len(self.bot.detector.seed_hashes)}  ·  pool {len(self.config.learned_hashes)}  ·  {learn}",
+                    inline=False)
+
+        ocr_on = self.bot.detector.ocr is not None
+        host_notes = [f"Image text (OCR)  {'On' if ocr_on else 'Off — install Tesseract, see README'}"]
+        if not actions.dms_enabled():
+            host_notes.append("Resecure DMs are off bot-wide (EXORCIST_DISABLE_DMS)")
+        e.add_field(name="Host", value="\n".join(host_notes), inline=False)
+
+        stats = c.get("stats", {})
+        e.add_field(name="Activity",
+                    value=(f"Caught {stats.get('caught', 0)}  ·  Honeypot {stats.get('honeypot', 0)}"
+                           f"  ·  False alarms {stats.get('false_alarms', 0)}"),
                     inline=False)
         e.add_field(name="Access", value=self._access_text(c), inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
