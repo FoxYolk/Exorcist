@@ -1,0 +1,45 @@
+# env + runtime config (learned scam hashes live in here too)
+.env
+config.json
+
+# training images and media, only the hashes ever get committed not the source pics
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.heic
+*.mp4
+*.mov
+*.webm
+# common spots to drop screenshots to train from
+scam_pics/
+training/
+train_data/
+samples/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# claude / agent junk
+.claude/
+CLAUDE.md
+.cursor/
+
+# editors + os
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# logs
+*.log

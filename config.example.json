@@ -1,0 +1,25 @@
+{
+  "guilds": {
+    "111111111111111111": {
+      "enabled": true,
+      "channels": "all",
+      "methods": ["behavior", "imagehash", "keyword", "honeypot"],
+      "log_channel": 222222222222222222,
+      "trap_channel": 444444444444444444,
+      "test_channel": 555555555555555555,
+      "action_mode": "auto",
+      "punishments": ["timeout", "dm"],
+      "timeout_minutes": 60,
+      "self_unmute": false,
+      "learn": false,
+      "hash_distance": 14,
+      "threshold": 0.8,
+      "exempt_mods": true,
+      "access": {
+        "users": [333333333333333333],
+        "roles": []
+      }
+    }
+  },
+  "learned_hashes": []
+}

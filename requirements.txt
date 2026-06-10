@@ -1,0 +1,7 @@
+discord.py==2.6.4
+python-dotenv==1.0.1
+Pillow==11.0.0
+imagehash==4.3.1
+
+# ocr, reads text out of scam images
+pytesseract==0.3.13
