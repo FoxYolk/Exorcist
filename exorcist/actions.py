@@ -11,6 +11,15 @@ log = logging.getLogger("exorcist.actions")
 # on the DM.
 DM_TIMEOUT = 10
 
+# global off switch for resecure DMs, flipped from EXORCIST_DISABLE_DMS at startup. when off,
+# Exorcist never DMs anyone on any server, even if "dm" is in that server's punishments.
+_dms_enabled = True
+
+
+def set_dms_enabled(enabled):
+    global _dms_enabled
+    _dms_enabled = enabled
+
 RESECURE_DM = (
     "Hey, your account just posted a scam in **{guild}**, which almost always means it got "
     "hacked. We took the message down and paused your account there so it can't keep spamming.\n\n"
@@ -34,7 +43,7 @@ async def punish(message, guild_conf, reason):
     picks = guild_conf["punishments"]
     done = []
 
-    if "dm" in picks:
+    if "dm" in picks and _dms_enabled:
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(STEPS, 1))
         body = RESECURE_DM.format(guild=message.guild.name, steps=steps)
         view = None

@@ -8,12 +8,18 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiohttp
+
 log = logging.getLogger("exorcist.detection")
 
 INVITE_RE = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.I)
 MONEY_RE = re.compile(r"\$\s?\d[\d,]{2,}|\b\d{3,6}\s?(?:usdt|usd|eth|btc)\b", re.I)
 GIFT_WORDS = ("giveaway", "free", "reward", "claim", "bonus", "prize")
 MAX_IMAGES = 4
+MAX_FRAMES = 4                                 # frames sampled from an animated gif/webp
+IMAGE_EMBED_TYPES = {"image", "gifv", "gif"}   # embed types we treat as a scam image source
+EMBED_FETCH_TIMEOUT = 10
+MAX_EMBED_BYTES = 8_000_000
 
 
 @dataclass
@@ -118,7 +124,29 @@ class Detector:
                 blobs.append((a.filename, await a.read()))
             except Exception as e:
                 log.warning("couldn't download attachment: %s", e)
+        # tenor/giphy gifs and pasted image links come through as embeds, not attachments
+        room = MAX_IMAGES - len(blobs)
+        urls = embed_images(message)
+        if urls and room > 0:
+            blobs.extend(await self._fetch_embeds(urls[:room]))
         return blobs
+
+    async def _fetch_embeds(self, urls):
+        out = []
+        async with aiohttp.ClientSession() as session:
+            for url in urls:
+                if not url.startswith(("http://", "https://")):
+                    continue
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=EMBED_FETCH_TIMEOUT)) as resp:
+                        if resp.status != 200 or not resp.content_type.startswith("image/"):
+                            continue
+                        if (resp.content_length or 0) > MAX_EMBED_BYTES:
+                            continue
+                        out.append((embed_name(url), await resp.read()))
+                except Exception as e:
+                    log.warning("couldn't fetch embed image: %s", e)
+        return out
 
     async def _read_images(self, blobs):
         if not blobs or not self.ocr:
@@ -140,13 +168,13 @@ class Detector:
         known = list(self.config.learned_hashes) + self.seed_hashes
         best_hash = best_img = best_name = None
         for name, data in blobs:
-            h = await asyncio.to_thread(phash, data)
-            if not h:
+            frame_hashes = await asyncio.to_thread(phashes, data)
+            if not frame_hashes:
                 continue
             if best_hash is None:
-                best_hash, best_img, best_name = h, data, name
-            if self._matches(imagehash, h, known, max_distance):
-                return 1.0, ["Matches a known scam image"], h, data, name
+                best_hash, best_img, best_name = frame_hashes[0], data, name
+            if any(self._matches(imagehash, h, known, max_distance) for h in frame_hashes):
+                return 1.0, ["Matches a known scam image"], frame_hashes[0], data, name
         return 0.0, [], best_hash, best_img, best_name
 
     def _matches(self, imagehash, h, known, max_distance):
@@ -160,8 +188,9 @@ class Detector:
         return False
 
     def _score_keywords(self, message, ocr_text):
-        typed = message.content or ""
-        text = f"{typed}\n{ocr_text}" if ocr_text else typed
+        typed = message_text(message)
+        extra = "\n".join(x for x in (ocr_text, embed_text(message)) if x)
+        text = f"{typed}\n{extra}" if extra else typed
         low = text.lower()
         typed_low = typed.lower()
         score = 0.0
@@ -202,8 +231,26 @@ class Detector:
         return score, reasons
 
 
+def message_parts(message):
+    # a forwarded message keeps the original in message_snapshots, each with its own content,
+    # attachments and embeds. snapshots expose the same fields as a message, so walking them
+    # together lets every check see forwarded scams too.
+    return [message, *getattr(message, "message_snapshots", [])]
+
+
+def part_attachments(part):
+    return getattr(part, "attachments", None) or []
+
+
+def part_embeds(part):
+    return getattr(part, "embeds", None) or []
+
+
 def image_attachments(message):
-    return [a for a in message.attachments if (a.content_type or "").startswith("image/")]
+    out = []
+    for part in message_parts(message):
+        out.extend(a for a in part_attachments(part) if (a.content_type or "").startswith("image/"))
+    return out
 
 
 def first_image(message):
@@ -211,19 +258,88 @@ def first_image(message):
     return images[0] if images else None
 
 
+def message_text(message):
+    return "\n".join(getattr(p, "content", "") or "" for p in message_parts(message)).strip()
+
+
+def embed_images(message):
+    # tenor/giphy gifs and pasted image links arrive as image-ish embeds, not attachments.
+    # ordinary link previews (type 'link'/'article'/'video') are skipped so we aren't pulling a
+    # thumbnail for every link someone drops.
+    urls = []
+    for part in message_parts(message):
+        for e in part_embeds(part):
+            if e.type not in IMAGE_EMBED_TYPES:
+                continue
+            for media in (e.image, e.thumbnail):
+                url = media.proxy_url or media.url
+                if url:
+                    urls.append(url)
+    return urls
+
+
+def embed_text(message):
+    chunks = []
+    for part in message_parts(message):
+        for e in part_embeds(part):
+            chunks += [e.title, e.description, e.author.name, e.footer.text]
+            chunks += [f"{f.name} {f.value}" for f in e.fields]
+    return "\n".join(c for c in chunks if c)
+
+
+def embed_name(url):
+    name = url.split("?", 1)[0].rsplit("/", 1)[-1]
+    return name or "embed.png"
+
+
 def content_key(message):
-    key = (message.content or "").lower().strip()
-    if message.attachments:
-        key += "|" + "|".join(a.filename for a in message.attachments)
+    key = message_text(message).lower()
+    names = [a.filename for p in message_parts(message) for a in part_attachments(p)]
+    if names:
+        key += "|" + "|".join(names)
     return key
 
 
 def worth_tracking(message):
     # don't let short everyday chatter ('gm', 'lol') count toward the spray check
-    if message.attachments:
+    if any(part_attachments(p) for p in message_parts(message)):
         return True
-    text = (message.content or "").strip()
+    text = message_text(message)
     return len(text) >= 12 or "http" in text.lower()
+
+
+def phashes(data, max_frames=MAX_FRAMES):
+    """Perceptual hashes for an image. A still image gives one hash, computed exactly like
+    phash so the shipped seeds still match. An animated gif or webp gives a few, sampled
+    across its frames, so a scam shown only on a later frame is caught and not just frame 0."""
+    try:
+        import imagehash
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data))
+    except Exception:
+        return []
+    total = getattr(img, "n_frames", 1)
+    if total <= 1 or max_frames <= 1:
+        try:
+            return [str(imagehash.phash(img))]
+        except Exception:
+            return []
+    out = []
+    for i in frame_indexes(total, max_frames):
+        try:
+            img.seek(i)
+            out.append(str(imagehash.phash(img.convert("RGB"))))
+        except Exception:
+            continue
+    return out
+
+
+def frame_indexes(total, count):
+    if total <= 1 or count <= 1:
+        return [0]
+    count = min(count, total)
+    return sorted({round(i * (total - 1) / (count - 1)) for i in range(count)})
 
 
 def phash(data):

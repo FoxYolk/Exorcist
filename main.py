@@ -25,6 +25,8 @@ def main():
         "keywords_path": root / "data" / "keywords.json",
         "seed_hashes_path": root / "data" / "seed_hashes.json",
         "tesseract_cmd": os.environ.get("TESSERACT_CMD") or None,
+        # set EXORCIST_DISABLE_DMS=1 to stop Exorcist DMing anyone on any server
+        "dms_enabled": os.environ.get("EXORCIST_DISABLE_DMS", "").strip().lower() not in ("1", "true", "yes", "on"),
     }
 
     Exorcist(settings).run(token, log_handler=None)

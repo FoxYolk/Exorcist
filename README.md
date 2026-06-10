@@ -39,6 +39,11 @@ weaker signals need to stack up. This means that a real member sharing a normal 
 does not get punished. The honeypot skips the scoring entirely, since posting there is an
 instant catch.
 
+Detection also looks past how the scam is delivered. It follows **forwarded messages** into
+the original they carry, pulls images and text out of **Tenor/Giphy GIFs and pasted image
+links** (which arrive as embeds rather than uploads), reads the text in **link previews**, and
+samples a few frames of **animated GIFs** so a scam shown only partway through still matches.
+
 ## Setup
 
 ### 1. Make the bot
@@ -95,6 +100,11 @@ the honeypot. Nothing turns on until you finish the wizard.
 Every setting can be changed afterward with `/settings`, which allows you to pick a single
 setting and edit it without rerunning the whole wizard. `/status` shows the current
 configuration, and `/toggle` turns detection on or off.
+
+The resecure DM is just one of the punishments, so to stop Exorcist messaging users in a
+single server, drop **DM them to resecure** from that server's punishments in `/settings`. To
+turn DMs off everywhere at once, set `EXORCIST_DISABLE_DMS=1` in your `.env` and restart;
+Exorcist then won't DM anyone on any server, regardless of each server's punishments.
 
 ### Self-unmute
 

@@ -4,8 +4,10 @@ import logging
 log = logging.getLogger("exorcist.ocr")
 
 # tesseract crawls on huge bitmaps, so bound the work two ways: never feed it more than this
-# many pixels, and kill any single read that still runs past this many seconds.
-MAX_PIXELS = 5_000_000
+# many pixels (kept low on purpose, OCR is single threaded and slow on small VPS cpus, and a
+# capped image still reads scam text fine), and kill any read that still runs past the timeout.
+# raise MAX_PIXELS if you run on a fast box and want a touch more accuracy on dense screenshots.
+MAX_PIXELS = 2_000_000
 READ_TIMEOUT = 20
 
 

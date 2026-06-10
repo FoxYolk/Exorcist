@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 from . import theme
-from .actions import UnmuteButton
+from .actions import UnmuteButton, set_dms_enabled
 from .config import Config
 from .detection import Detector
 from .ocr import load_ocr
@@ -24,6 +24,7 @@ class Exorcist(commands.Bot):
         self.detector = Detector(
             self.config, settings["keywords_path"], settings["seed_hashes_path"], ocr
         )
+        set_dms_enabled(settings.get("dms_enabled", True))
 
     async def setup_hook(self):
         self.add_dynamic_items(UnmuteButton)
